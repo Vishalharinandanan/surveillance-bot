@@ -2,6 +2,55 @@ import math
 import numpy as np
 import serial
 import time
+import threading
+import socket
+from dataExchange import _recvhex, _sendmsg, _recvdata
+from undistortion import _init_fisheye_map, _remap
+
+obstacle_detected = False
+
+def lidar_obstacle_monitor():
+    global obstacle_detected
+
+    WIDTH = 320
+    HEIGHT = 24
+    tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    tcp.setsockopt(socket.SOL_SOCKET, socket.TCP_NODELAY, 1)
+    tcp.connect(('192.168.1.80', 50660))
+    tcp.settimeout(2)
+
+    cameraMatrix = np.array([[149.905, 0.0, 159.5], [0.0, 150.24, 11.5], [0.0, 0.0, 1.0]])
+    distCoeffs = np.array([-0.059868055, -0.001303471, 0.010260736, -0.006102915])
+    mapX, mapY = _init_fisheye_map(cameraMatrix, distCoeffs, HEIGHT, 660)
+
+    _sendmsg(tcp, "getDistanceAndAmplitudeSorted")
+
+    while True:
+        try:
+            distData = _recvdata(tcp, HEIGHT, WIDTH)
+            ampData = _recvdata(tcp, HEIGHT, WIDTH)
+            nearPt = _recvhex(tcp, 3)
+
+            if distData is None:
+                continue
+
+            # Undistort the distance data
+            undistorted = _remap(distData, mapX, mapY, HEIGHT, 660)
+            valid_distances = undistorted[undistorted > 0]
+            if valid_distances.size == 0:
+                continue
+
+            min_distance = np.min(valid_distances)
+            print(f"Closest object: {min_distance:.1f} mm")
+
+            if min_distance < 35:  # 10 cm
+                obstacle_detected = True
+            else:
+                obstacle_detected = False
+
+        except Exception as e:
+            print(f"Lidar error: {e}")
+            obstacle_detected = True
 
 class DifferentialDriveRobot:
     def __init__(self):
@@ -23,8 +72,6 @@ class DifferentialDriveRobot:
         rpm_left = w1 * 60 / (2 * math.pi)
         rpm_right = w2 * 60 / (2 * math.pi)
 
-        return rpm_left, rpm_right
-
     def update_position(self, linear_vel, angular_vel, dt):
         dx = linear_vel * math.cos(self.orientation)
         dy = linear_vel * math.sin(self.orientation)
@@ -36,7 +83,6 @@ class DifferentialDriveRobot:
     def get_position(self):
         return self.position, self.orientation
 
-
 def send_rpm_to_arduino(ser, rpm_left, rpm_right):
     try:
         message = f"{rpm_left:.2f},{rpm_right:.2f}\n"
@@ -45,21 +91,18 @@ def send_rpm_to_arduino(ser, rpm_left, rpm_right):
     except Exception as e:
         print("Error sending to Arduino:", e)
 
-
 def navigate_to_waypoints():
     robot = DifferentialDriveRobot()
     dt = 0.1
-    max_linear_velocity = 0.4
-    min_turn_ratio = 0.4  # How slow the inner wheel should go when turning
+    max_linear_velocity = 0.3
+    min_turn_ratio = 0.4
 
     waypoints = [
-    np.array([0.00, 0.00]),
-    np.array([5.00, 0.00]),
-    np.array([5.00, 5.00]),
-    np.array([0.00, 5.00]),
-    np.array([0.00, 0.00])
+        np.array([1.0, 0.0]),
+        np.array([1.0, 1.0]),
+        np.array([0.0, 1.0]),
+        np.array([0.0, 0.0])
     ]
-
 
     try:
         ser = serial.Serial('COM3', 9600, timeout=1)
@@ -73,6 +116,12 @@ def navigate_to_waypoints():
             print(f"Navigating to waypoint: ({target[0]}, {target[1]})")
 
             while True:
+                if obstacle_detected:
+                    send_rpm_to_arduino(ser, 0, 0)
+                    print("Obstacle detected - waiting...")
+                    time.sleep(0.1)
+                    continue
+
                 position, theta = robot.get_position()
                 direction = target - position
                 distance = np.linalg.norm(direction)
@@ -106,19 +155,20 @@ def navigate_to_waypoints():
                 rpm_left = w_l * 60 / (2 * math.pi)
                 rpm_right = w_r * 60 / (2 * math.pi)
 
-                send_rpm_to_arduino(ser, rpm_left, rpm_right)
-                avg_velocity = (v_left + v_right) / 2
-                angular_velocity = (v_right - v_left) / robot.robot_width
-                robot.update_position(avg_velocity, angular_velocity, dt)
+                if not obstacle_detected:
+                    send_rpm_to_arduino(ser, rpm_left, rpm_right)
+                    avg_velocity = (v_left + v_right) / 2
+                    angular_velocity = (v_right - v_left) / robot.robot_width
+                else:
+                    send_rpm_to_arduino(ser, 0, 0)
 
+                robot.update_position(avg_velocity, angular_velocity, dt)
                 time.sleep(dt)
 
     send_rpm_to_arduino(ser, 0, 0)
     ser.close()
 
-
-
-
-
 if __name__ == "__main__":
+    lidar_thread = threading.Thread(target=lidar_obstacle_monitor, daemon=True)
+    lidar_thread.start()
     navigate_to_waypoints()
